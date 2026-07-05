@@ -1,0 +1,10 @@
+node_modules/
+.env
+*.log
+logs/
+debug-*
+capture-*
+meeting-*.html
+meeting-*.txt
+meeting-*.png
+.DS_Store
