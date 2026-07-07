@@ -5,6 +5,12 @@ const logger = require('./logger');
 const JOIN_TIMEOUT = parseInt(process.env.JOIN_TIMEOUT_MS || '30000', 10);
 const HEADLESS = process.env.HEADLESS === 'true';
 const BOT_NAME = process.env.BOT_NAME || 'PickerBot';
+const normalizeName = (value) => String(value || '').trim().toLocaleLowerCase();
+const BOT_NAME_NORMALIZED = normalizeName(BOT_NAME);
+const isExcludedBotName = (value) => {
+  const normalized = normalizeName(value);
+  return normalized === BOT_NAME_NORMALIZED || normalized.includes('bot');
+};
 
 /**
  * DOM selectors for the Teams web client.
@@ -81,7 +87,7 @@ class SessionManager {
       let names = await this.page.$$eval(SEL.participantName, (els) =>
         els
           .map((el) => el.textContent?.trim())
-          .filter((n) => n && n.length > 0 && n !== 'You')
+          .filter((n) => n && n.length > 0 && n !== 'You' && !isExcludedBotName(n))
       ).catch(() => []);
 
       // If no names found, try alternative extraction
@@ -91,12 +97,14 @@ class SessionManager {
         names = await this.page.$$eval('[role="listitem"]', (els) =>
           els
             .map((el) => el.textContent?.trim())
-            .filter((n) => n && n.length > 2 && n !== 'You')
+            .filter((n) => n && n.length > 2 && n !== 'You' && !isExcludedBotName(n))
         ).catch(() => []);
       }
 
       // Deduplicate and sort
-      this.participants = [...new Set(names)].sort((a, b) => a.localeCompare(b));
+      this.participants = [...new Set(names)]
+        .filter((name) => !isExcludedBotName(name))
+        .sort((a, b) => a.localeCompare(b));
       logger.info(`Scraped ${this.participants.length} participant(s)`);
       
       if (this.participants.length === 0) {
@@ -121,12 +129,16 @@ class SessionManager {
    * @returns {string|null} The picked name, or null if all have been picked or no participants available
    */
   pickRandomParticipant() {
-    const available = this.participants.filter(name => !this.pickedNames.has(name));
+    const available = this.participants.filter(
+      (name) => !this.pickedNames.has(name) && !isExcludedBotName(name)
+    );
     
     if (available.length === 0) {
       logger.warn('All participants already picked. Resetting the picked list.');
       this.pickedNames.clear(); // Reset if all picked
-      const resetAvailable = this.participants.filter(name => !this.pickedNames.has(name));
+      const resetAvailable = this.participants.filter(
+        (name) => !this.pickedNames.has(name) && !isExcludedBotName(name)
+      );
       if (resetAvailable.length === 0) return null;
       return resetAvailable[Math.floor(Math.random() * resetAvailable.length)];
     }
