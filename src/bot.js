@@ -5,22 +5,6 @@ const logger = require('./logger');
 const JOIN_TIMEOUT = parseInt(process.env.JOIN_TIMEOUT_MS || '30000', 10);
 const HEADLESS = process.env.HEADLESS === 'true';
 const BOT_NAME = process.env.BOT_NAME || 'PickerBot';
-const PICK_COOLDOWN_MS = parseInt(process.env.PICK_COOLDOWN_MS || String(7 * 60 * 1000), 10);
-
-function isBotParticipantName(name) {
-  if (!name) return false;
-
-  const normalized = String(name).trim().toLowerCase();
-  const botName = BOT_NAME.trim().toLowerCase();
-
-  // Exclude this bot's display name and common bot-like aliases.
-  return (
-    normalized === botName ||
-    normalized.startsWith(`${botName} `) ||
-    normalized.includes('pickerbot') ||
-    /\bbot\b|bot\d+|unverified\)\s*bot|bot\s*\(/i.test(normalized)
-  );
-}
 
 /**
  * DOM selectors for the Teams web client.
@@ -38,23 +22,22 @@ const SEL = {
   nameInput:         'input[data-tid="prejoin-display-name-input"], input[placeholder*="name" i], input[aria-label*="name" i]',
   cameraToggle:      'button[data-tid="toggle-av"], button[aria-label*="camera" i], button[title*="camera" i]',
   micToggle:         'button[data-tid="toggle-mute-button"], button[aria-label*="microphone" i], button[title*="mic" i]',
-  joinBtn:           'button[data-tid="prejoin-join-button"], button[data-tid="joinButton"], button[aria-label*="Join now" i], button[aria-label*="Join meeting" i], button:has-text("Join now"), button:has-text("Join meeting"), button:has-text("Join"), [role="button"][aria-label*="Join" i], [role="button"]:has-text("Join now"), [role="button"]:has-text("Join")',
+  joinBtn:           'button[data-tid="prejoin-join-button"], button:has-text("Join now"), button[aria-label*="Join now"], button:has-text("Join meeting"), button[type="button"][class*="primary"]',
 
   // In-meeting controls
   participantsBtn:   '[data-tid="calling-roster-button"], button[aria-label*="People" i], button[title*="People" i]',
 
   // Participant roster panel
-  // rosterPanel:       '[role="tree"][aria-label*="Attendees"], [data-fui-tree-item-value*="roster"], [class*="fui-FlatTree"]',
-  rosterPanel:          '//div[@data-cid="roster-participant"]',
-  participantNameXPath: '//div[@data-tid="calling-roster-attendees"]//span[@title]',
+  rosterPanel:       '[role="tree"][aria-label*="Attendees"], [data-fui-tree-item-value*="roster"], [class*="fui-FlatTree"]',
+  participantName:   'span[id^="roster-avatar-img-"], [class*="fui-TreeItemPersonaLayout__main"] span[title], span[title][dir="auto"]',
 
   // Meeting loaded indicator - updated selectors for current Teams UI
   meetingToolbar:    '[data-tid="calling-component-container"], [class*="calling-unified-bar"], [role="region"][class*="call"], [data-testid*="call"], [class*="meetingToolbar"], button[data-tid="calling-roster-button"]',
 
   // Chat controls (for posting participant names)
-  chatBtn:           '[data-tid="calling-chat-button"], [data-tid="call-chat"], button[aria-label*="Chat" i], button[title*="Chat" i]',
-  chatInput:         'div[data-tid="ckeditor"][role="textbox"][contenteditable="true"]:visible, [data-tid="message-input"]:visible, [data-tid="compose-input"]:visible, div[role="textbox"][contenteditable="true"]:visible, textarea:visible',
-  sendButton:        '[data-tid="send-message-button"]:visible, [data-tid="send-button"]:visible, button[aria-label*="Send" i]:visible, button[title*="Send" i]:visible, button[aria-label="Send"]:visible',
+  chatBtn:           'button[data-tid="chat-button"], button[aria-label*="Chat" i], button[title*="Chat" i], [data-tid="callingButtons-showChatButton"]',
+  chatInput:         '[data-tid="ckeditor"], [data-tid="message-input"], [data-tid="compose-input"], div[role="textbox"][contenteditable="true"][placeholder*="message" i]',
+  sendButton:        '[data-tid="send-message-button"], button[aria-label*="Send" i], button[title*="Send" i], [data-tid="send-button"], button[aria-label="Send"]',
   chatPanel:         '[data-tid="message-pane"], [class*="messagePane"], [class*="chatPanel"]',
 };
 
@@ -66,33 +49,10 @@ class SessionManager {
     this.browser    = browser;
     this.page       = page;
     this.meetingUrl = meetingUrl;
-    this.participants = []; // Live participant list (updated on every scrape)
-    this.liveParticipantSet = new Set(); // Fast lookup for current roster snapshot
-    this.seenParticipants = new Set(); // Historical names seen in this session
+    this.participants = [];
     this.pickedNames = new Set(); // Track picked participants to avoid repeats
-    this.lastPickAt = 0; // Timestamp of the most recent successful pick
     this.status     = 'idle'; // idle | joining | in-meeting | error | left
     this.error      = null;
-  }
-
-  /**
-   * Whether a new pick is allowed right now.
-   *
-   * @returns {boolean}
-   */
-  canPickNow() {
-    return this.getPickCooldownRemainingMs() === 0;
-  }
-
-  /**
-   * Remaining cooldown before the next pick is allowed.
-   *
-   * @returns {number}
-   */
-  getPickCooldownRemainingMs() {
-    if (!this.lastPickAt) return 0;
-    const elapsed = Date.now() - this.lastPickAt;
-    return Math.max(0, PICK_COOLDOWN_MS - elapsed);
   }
 
   /**
@@ -111,25 +71,18 @@ class SessionManager {
 
       // Try to find and wait for participant elements
       try {
-        await this.page.waitForSelector(`xpath=${SEL.participantNameXPath}`, { timeout: 8000 });
+        await this.page.waitForSelector(SEL.participantName, { timeout: 8000 });
       } catch {
-        logger.warn('Primary XPath participant selector timed out — trying fallback methods...');
+        logger.warn('Primary participant selector timed out — trying fallback methods...');
         await this.page.waitForTimeout(2000);
       }
 
-      // Extract names from the requested Teams roster XPath.
-      let names = await this.page
-        .locator(`xpath=${SEL.participantNameXPath}`)
-        .evaluateAll((els) =>
-          els
-            .map((el) => {
-              const title = el.getAttribute('title')?.trim();
-              const text = el.textContent?.trim();
-              return title || text || '';
-            })
-            .filter((n) => n && n.length > 0 && n !== 'You')
-        )
-        .catch(() => []);
+      // Extract names using $$eval
+      let names = await this.page.$$eval(SEL.participantName, (els) =>
+        els
+          .map((el) => el.textContent?.trim())
+          .filter((n) => n && n.length > 0 && n !== 'You')
+      ).catch(() => []);
 
       // If no names found, try alternative extraction
       if (names.length === 0) {
@@ -142,21 +95,8 @@ class SessionManager {
         ).catch(() => []);
       }
 
-      // Deduplicate and sort, then sync in-memory roster tracking.
-      const deduped = [...new Set(names)].sort((a, b) => a.localeCompare(b));
-      const previousLive = this.liveParticipantSet;
-
-      this.participants = deduped;
-      this.liveParticipantSet = new Set(deduped);
-      deduped.forEach((name) => this.seenParticipants.add(name));
-
-      const joinedCount = deduped.filter((name) => !previousLive.has(name)).length;
-      const leftCount = [...previousLive].filter((name) => !this.liveParticipantSet.has(name)).length;
-
-      if (joinedCount > 0 || leftCount > 0) {
-        logger.info(`Roster changed: +${joinedCount} joined, -${leftCount} left`);
-      }
-
+      // Deduplicate and sort
+      this.participants = [...new Set(names)].sort((a, b) => a.localeCompare(b));
       logger.info(`Scraped ${this.participants.length} participant(s)`);
       
       if (this.participants.length === 0) {
@@ -169,23 +109,9 @@ class SessionManager {
       return this.participants;
     } catch (err) {
       logger.warn(`Scrape failed: ${err.message}`);
-      logger.warn('Tip: update SEL.participantNameXPath in bot.js using DevTools on teams.microsoft.com');
+      logger.warn('Tip: update SEL.participantName in bot.js using DevTools on teams.microsoft.com');
       return this.participants; // return last known list
     }
-  }
-
-  /**
-   * Returns current eligible names that can be picked.
-   * Excludes custom excluded names and already-picked names.
-   *
-   * @param {string[]} exclude
-   * @returns {string[]}
-   */
-  getAvailableParticipants(exclude = []) {
-    const excluded = new Set(exclude);
-    return this.participants.filter(
-      (name) => !excluded.has(name) && !this.pickedNames.has(name) && !isBotParticipantName(name)
-    );
   }
 
   /**
@@ -194,28 +120,20 @@ class SessionManager {
    * 
    * @returns {string|null} The picked name, or null if all have been picked or no participants available
    */
-  pickRandomParticipant(exclude = [], options = {}) {
-    const { commit = true } = options;
-
-    if (!this.canPickNow()) {
-      const remainingMs = this.getPickCooldownRemainingMs();
-      logger.warn(`Pick cooldown active: ${Math.ceil(remainingMs / 1000)}s remaining`);
-      return null;
-    }
-
-    const available = this.getAvailableParticipants(exclude);
-
+  pickRandomParticipant() {
+    const available = this.participants.filter(name => !this.pickedNames.has(name));
+    
     if (available.length === 0) {
-      logger.warn('No unpicked participants available in the current roster.');
-      return null;
+      logger.warn('All participants already picked. Resetting the picked list.');
+      this.pickedNames.clear(); // Reset if all picked
+      const resetAvailable = this.participants.filter(name => !this.pickedNames.has(name));
+      if (resetAvailable.length === 0) return null;
+      return resetAvailable[Math.floor(Math.random() * resetAvailable.length)];
     }
     
     const picked = available[Math.floor(Math.random() * available.length)];
-    if (commit) {
-      this.pickedNames.add(picked);
-      this.lastPickAt = Date.now();
-    }
-    logger.info(`Picked: "${picked}" (${this.pickedNames.size} unique picked total)`);
+    this.pickedNames.add(picked);
+    logger.info(`Picked: "${picked}" (${this.pickedNames.size}/${this.participants.length} picked)`);
     return picked;
   }
 
@@ -229,35 +147,23 @@ class SessionManager {
     try {
       logger.info(`Attempting to send chat message: "${message}"`);
 
-      // Ensure chat pane/composer is visible before targeting the composer.
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        const composerVisible = await this.page.locator(SEL.chatInput).first().isVisible().catch(() => false);
-        if (composerVisible) break;
-
-        logger.info(`Opening chat panel (attempt ${attempt}/3)...`);
-        await this.page.click(SEL.chatBtn, { timeout: 5000 }).catch(() => {});
+      // Open the chat panel first (it is hidden until the chat button is clicked)
+      const chatBtnLocator = this.page.locator(SEL.chatBtn).first();
+      const chatBtnVisible = await chatBtnLocator.isVisible({ timeout: 3000 }).catch(() => false);
+      if (chatBtnVisible) {
+        logger.info('Opening chat panel...');
+        await chatBtnLocator.click();
         await this.page.waitForTimeout(1000);
+      } else {
+        logger.warn('Chat button not found — panel may already be open');
       }
 
-      const pickVisibleLocator = async (selector) => {
-        const loc = this.page.locator(selector);
-        const count = await loc.count();
-        for (let i = 0; i < count; i++) {
-          const candidate = loc.nth(i);
-          if (await candidate.isVisible().catch(() => false)) {
-            return candidate;
-          }
-        }
-        return loc.first();
-      };
-
-      // Click on chat input field
-      const chatInputLocator = await pickVisibleLocator(SEL.chatInput);
-      const chatInputVisible = await chatInputLocator.isVisible({ timeout: 3000 }).catch(() => false);
-      
-      if (!chatInputVisible) {
-        logger.warn('Chat input is still not visible after chat-open attempts.');
-        return false;
+      // Wait for chat input to become visible
+      const chatInputLocator = this.page.locator(SEL.chatInput).first();
+      try {
+        await chatInputLocator.waitFor({ state: 'visible', timeout: 8000 });
+      } catch {
+        logger.warn('Chat input still not visible after opening panel — proceeding anyway...');
       }
 
       // Click and focus the input
@@ -270,7 +176,7 @@ class SessionManager {
       await this.page.waitForTimeout(200);
 
       // Send the message
-      const sendBtnLocator = await pickVisibleLocator(SEL.sendButton);
+      const sendBtnLocator = this.page.locator(SEL.sendButton).first();
       const sendBtnVisible = await sendBtnLocator.isVisible({ timeout: 2000 }).catch(() => false);
       
       if (!sendBtnVisible) {
@@ -298,47 +204,23 @@ class SessionManager {
    */
   async pickAndPostToChat() {
     try {
-      const cooldownRemainingMs = this.getPickCooldownRemainingMs();
-      if (cooldownRemainingMs > 0) {
-        logger.warn(`Pick blocked by cooldown: ${Math.ceil(cooldownRemainingMs / 1000)}s remaining`);
-        return {
-          success: false,
-          error: 'Pick cooldown is active',
-          cooldownRemainingMs,
-        };
-      }
-
       // Refresh participant list
-      const previousParticipants = [...this.participants];
-      const refreshedParticipants = await this.scrapeParticipants();
-      if (refreshedParticipants.length === 0 && previousParticipants.length > 0) {
-        logger.warn('Transient empty roster detected — reusing last non-empty participant snapshot.');
-        this.participants = previousParticipants;
-        this.liveParticipantSet = new Set(previousParticipants);
-      }
+      await this.scrapeParticipants();
 
       // Pick a random participant (no repeats)
-      const pickedName = this.pickRandomParticipant([], { commit: false });
+      const pickedName = this.pickRandomParticipant();
       
       if (!pickedName) {
-        logger.warn('No participants available to pick without duplicates');
-        return { success: false, error: 'No unpicked participants available in the current roster' };
+        logger.warn('No participants available to pick');
+        return { success: false, error: 'No participants available' };
       }
 
       // Post to chat
       const chatMessage = `🎤 Next speaker: ${pickedName}`;
       const messageSent = await this.sendChatMessage(chatMessage);
 
-      if (!messageSent) {
-        logger.warn('Auto-pick aborted: chat post failed, pick not committed.');
-        return { success: false, error: 'Failed to post message to Teams chat' };
-      }
-
-      this.pickedNames.add(pickedName);
-      this.lastPickAt = Date.now();
-
       return {
-        success: true,
+        success: messageSent,
         picked: pickedName,
         totalPicked: this.pickedNames.size,
         totalParticipants: this.participants.length,
@@ -382,6 +264,7 @@ async function joinMeeting(meetingUrl) {
       '--disable-dev-shm-usage',
       '--use-fake-ui-for-media-stream',    // auto-grant camera/mic in browser UI
       '--use-fake-device-for-media-stream', // use virtual devices — no real camera/mic needed
+      '--mute-audio',                       // prevent any audio output through machine speakers
       '--disable-blink-features=AutomationControlled', // reduces bot detection
     ],
   });
@@ -397,22 +280,6 @@ async function joinMeeting(meetingUrl) {
   const page = await context.newPage();
   const session = new SessionManager(browser, page, meetingUrl);
   session.status = 'joining';
-
-  async function clickInAnyFrame(selector, timeoutMs = 2500) {
-    const started = Date.now();
-    while (Date.now() - started < timeoutMs) {
-      for (const frame of page.frames()) {
-        const candidate = frame.locator(selector).first();
-        const visible = await candidate.isVisible().catch(() => false);
-        if (visible) {
-          await candidate.click({ timeout: 1500 });
-          return true;
-        }
-      }
-      await page.waitForTimeout(300);
-    }
-    return false;
-  }
 
   // ── Step 1: Navigate ──────────────────────────────────────────────────────
   logger.info('Navigating to meeting URL...');
@@ -503,9 +370,10 @@ async function joinMeeting(meetingUrl) {
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       logger.info(`Join button search (attempt ${attempt}/3)...`);
-      const joinClicked = await clickInAnyFrame(SEL.joinBtn, 8000);
-      if (joinClicked) {
+      const joinBtn = await page.waitForSelector(SEL.joinBtn, { timeout: 8000 });
+      if (joinBtn) {
         logger.info('✓ Found join button, clicking...');
+        await joinBtn.click();
         logger.info('✓ Clicked join button');
         joinButtonFound = true;
         break;

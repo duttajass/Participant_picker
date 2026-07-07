@@ -8,8 +8,6 @@ const logger   = require('./logger');
 const app  = express();
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const AUTO_REFRESH_MS = parseInt(process.env.AUTO_REFRESH_MS || '0', 10);
-const AUTO_PICK_ON_JOIN = process.env.AUTO_PICK_ON_JOIN !== 'false';
-const AUTO_PICK_RETRY_MS = parseInt(process.env.AUTO_PICK_RETRY_MS || '30000', 10);
 
 app.use(cors());
 app.use(express.json());
@@ -26,48 +24,7 @@ function sessionSummary(session) {
     meetingUrl:   session.meetingUrl,
     participants: session.participants,
     count:        session.participants.length,
-    autoPickEnabled: !!session._autoPickEnabled,
   };
-}
-
-function clearAutoPickTimer(session) {
-  if (session._autoPickTimer) {
-    clearTimeout(session._autoPickTimer);
-    session._autoPickTimer = null;
-  }
-}
-
-function scheduleAutoPick(meetingUrl, delayMs = 0) {
-  const session = sessions.get(meetingUrl);
-  if (!session || !session._autoPickEnabled) return;
-
-  clearAutoPickTimer(session);
-
-  session._autoPickTimer = setTimeout(async () => {
-    const current = sessions.get(meetingUrl);
-    if (!current || !current._autoPickEnabled) return;
-
-    try {
-      const result = await current.pickAndPostToChat();
-
-      if (result.success) {
-        logger.info(`AUTO-PICK posted: "${result.picked}"`);
-        scheduleAutoPick(meetingUrl, Math.max(1000, current.getPickCooldownRemainingMs()));
-        return;
-      }
-
-      if (result.cooldownRemainingMs) {
-        scheduleAutoPick(meetingUrl, Math.max(1000, result.cooldownRemainingMs));
-        return;
-      }
-
-      logger.warn(`AUTO-PICK skipped: ${result.error || 'unknown error'}`);
-      scheduleAutoPick(meetingUrl, AUTO_PICK_RETRY_MS);
-    } catch (err) {
-      logger.error(`AUTO-PICK failed: ${err.message}`);
-      scheduleAutoPick(meetingUrl, AUTO_PICK_RETRY_MS);
-    }
-  }, Math.max(0, delayMs));
 }
 
 // ── Routes ─────────────────────────────────────────────────────────────────
@@ -115,12 +72,6 @@ app.post('/api/join', async (req, res) => {
         await session.scrapeParticipants().catch(() => {});
       }, AUTO_REFRESH_MS);
       session._refreshTimer = timer;
-    }
-
-    session._autoPickEnabled = AUTO_PICK_ON_JOIN;
-    if (session._autoPickEnabled) {
-      logger.info(`AUTO-PICK enabled for session. Retry interval on empty/error: ${AUTO_PICK_RETRY_MS}ms`);
-      scheduleAutoPick(meetingUrl, 5000);
     }
 
     res.json({ success: true, session: sessionSummary(session) });
@@ -179,26 +130,16 @@ app.post('/api/pick', async (req, res) => {
   try {
     const session = sessions.get(meetingUrl);
 
-    const cooldownRemainingMs = session.getPickCooldownRemainingMs();
-    if (cooldownRemainingMs > 0) {
-      return res.status(429).json({
-        error: 'Pick cooldown is active. Try again later.',
-        cooldownRemainingMs,
-        retryAfterSeconds: Math.ceil(cooldownRemainingMs / 1000),
-      });
-    }
-
-    // Keep picks synced with the latest dynamic attendee roster.
     await session.scrapeParticipants();
 
-    const pool = session.getAvailableParticipants(exclude);
+    const pool = session.participants.filter((n) => !exclude.includes(n));
     if (pool.length === 0) {
       return res.status(422).json({
-        error: 'No unpicked participants available after exclusions.',
+        error: 'No participants available after exclusions.',
       });
     }
 
-    const picked = session.pickRandomParticipant(exclude);
+    const picked = pool[Math.floor(Math.random() * pool.length)];
     logger.info(`Picked: "${picked}" from ${pool.length} eligible participant(s)`);
     res.json({ picked, pool: pool.length, total: session.participants.length });
   } catch (err) {
@@ -224,25 +165,9 @@ app.post('/api/pick-and-post', async (req, res) => {
   try {
     const session = sessions.get(meetingUrl);
 
-    const cooldownRemainingMs = session.getPickCooldownRemainingMs();
-    if (cooldownRemainingMs > 0) {
-      return res.status(429).json({
-        error: 'Pick cooldown is active. Try again later.',
-        cooldownRemainingMs,
-        retryAfterSeconds: Math.ceil(cooldownRemainingMs / 1000),
-      });
-    }
-
     const result = await session.pickAndPostToChat();
 
     if (!result.success) {
-      if (result.cooldownRemainingMs) {
-        return res.status(429).json({
-          error: 'Pick cooldown is active. Try again later.',
-          cooldownRemainingMs: result.cooldownRemainingMs,
-          retryAfterSeconds: Math.ceil(result.cooldownRemainingMs / 1000),
-        });
-      }
       return res.status(500).json({ error: result.error || 'Failed to pick and post' });
     }
 
@@ -302,8 +227,6 @@ app.post('/api/leave', async (req, res) => {
   try {
     const session = sessions.get(meetingUrl);
     if (session._refreshTimer) clearInterval(session._refreshTimer);
-    clearAutoPickTimer(session);
-    session._autoPickEnabled = false;
     await session.leave();
     sessions.delete(meetingUrl);
     logger.info('Session ended and cleaned up.');
@@ -319,8 +242,6 @@ async function shutdown() {
   logger.info('Shutting down — closing all sessions...');
   for (const [url, session] of sessions) {
     if (session._refreshTimer) clearInterval(session._refreshTimer);
-    clearAutoPickTimer(session);
-    session._autoPickEnabled = false;
     await session.leave().catch(() => {});
     sessions.delete(url);
   }
