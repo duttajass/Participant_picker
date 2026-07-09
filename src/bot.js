@@ -90,6 +90,7 @@ class SessionManager {
     this.page       = page;
     this.meetingUrl = meetingUrl;
     this.participants = [];
+    this.lastNonEmptyParticipants = [];
     this.pickedNames = new Set(); // Track picked participants to avoid repeats
     this.status     = 'idle'; // idle | joining | in-meeting | error | left
     this.error      = null;
@@ -186,8 +187,18 @@ class SessionManager {
       }
 
       // Deduplicate and sort
-      this.participants = [...new Set(included)]
+      const nextParticipants = [...new Set(included)]
         .sort((a, b) => a.localeCompare(b));
+
+      if (nextParticipants.length === 0 && this.participants.length > 0) {
+        logger.warn('Transient empty scrape detected — keeping previous participant snapshot.');
+        return this.participants;
+      }
+
+      this.participants = nextParticipants;
+      if (this.participants.length > 0) {
+        this.lastNonEmptyParticipants = [...this.participants];
+      }
       logger.info(`Scraped ${this.participants.length} participant(s)`);
       
       if (this.participants.length === 0) {

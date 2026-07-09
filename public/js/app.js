@@ -1,6 +1,7 @@
 /* Teams Picker — frontend app */
 
 const API = '';  // same origin
+const PARTICIPANT_POLL_MS = 10000;
 
 // ── State ──────────────────────────────────────────────────────────────────
 const state = {
@@ -11,6 +12,8 @@ const state = {
   history:      [],          // [{ name, time }]
   autoExclude:  false,
 };
+let participantPollTimer = null;
+let isParticipantPollInFlight = false;
 
 // ── DOM refs ───────────────────────────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
@@ -74,6 +77,7 @@ btnJoin.addEventListener('click', async () => {
     const res = await apiFetch('/api/join', 'POST', { meetingUrl: url });
     state.meetingUrl   = url;
     state.participants = res.session.participants;
+    startParticipantPolling();
     setStatus('in-meeting', 'In meeting');
     showPicker();
     renderParticipants();
@@ -93,7 +97,7 @@ btnRefresh.addEventListener('click', async () => {
   participantsGrid.classList.add('loading');
 
   try {
-    const res = await apiFetch(`/api/participants?meetingUrl=${encodeURIComponent(state.meetingUrl)}`, 'GET');
+    const res = await fetchParticipants();
     state.participants = res.participants;
     renderParticipants();
     toast(`Updated — ${res.count} participant(s).`);
@@ -256,6 +260,7 @@ function showPicker() {
 }
 
 function resetState() {
+  stopParticipantPolling();
   state.meetingUrl   = null;
   state.participants = [];
   state.excluded.clear();
@@ -266,6 +271,44 @@ function resetState() {
   resultWinner.classList.add('hidden');
   resultPlaceholder.classList.remove('hidden');
   participantsGrid.innerHTML = '';
+}
+
+function startParticipantPolling() {
+  stopParticipantPolling();
+  participantPollTimer = setInterval(async () => {
+    if (!state.meetingUrl || isParticipantPollInFlight) {
+      return;
+    }
+
+    isParticipantPollInFlight = true;
+    try {
+      const res = await fetchParticipants();
+      if (res.count === 0 && state.participants.length > 0) {
+        return;
+      }
+      const prevSerialized = JSON.stringify(state.participants);
+      const nextSerialized = JSON.stringify(res.participants);
+      if (prevSerialized !== nextSerialized) {
+        state.participants = res.participants;
+        renderParticipants();
+      }
+    } catch {
+      // Avoid noisy UI errors during background refresh loops.
+    } finally {
+      isParticipantPollInFlight = false;
+    }
+  }, PARTICIPANT_POLL_MS);
+}
+
+function stopParticipantPolling() {
+  if (participantPollTimer) {
+    clearInterval(participantPollTimer);
+    participantPollTimer = null;
+  }
+}
+
+async function fetchParticipants() {
+  return await apiFetch(`/api/participants?meetingUrl=${encodeURIComponent(state.meetingUrl)}`, 'GET');
 }
 
 function setBtnLoading(btn, loading, label) {
