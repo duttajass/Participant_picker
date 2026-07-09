@@ -53,6 +53,7 @@ BOT_NAME=PickerBot        # Name shown in the Teams meeting
 HEADLESS=false            # false = see the browser (good for debugging)
                           # true  = runs in background (production)
 AUTO_REFRESH_MS=15000     # Auto-refresh participant list every 15s (0 = off)
+EXCLUDED_PARTICIPANT_TERMS=recording,transcription  # Optional extra roster entries to ignore
 ```
 
 ---

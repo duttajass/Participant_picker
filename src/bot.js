@@ -7,10 +7,44 @@ const HEADLESS = process.env.HEADLESS === 'true';
 const BOT_NAME = process.env.BOT_NAME || 'PickerBot';
 const normalizeName = (value) => String(value || '').trim().toLocaleLowerCase();
 const BOT_NAME_NORMALIZED = normalizeName(BOT_NAME);
-const isExcludedBotName = (value) => {
+const DEFAULT_EXCLUDED_PARTICIPANT_TERMS = [
+  'bot',
+  'recording',
+  'transcription',
+  'transcript',
+  'copilot',
+  'meeting recap',
+  'rakesh nayak',
+  'ayan ghorai',
+  'shouvik satpati',
+];
+const EXCLUDED_PARTICIPANT_TERMS = [
+  ...DEFAULT_EXCLUDED_PARTICIPANT_TERMS,
+  ...String(process.env.EXCLUDED_PARTICIPANT_TERMS || '')
+    .split(',')
+    .map((term) => normalizeName(term))
+    .filter(Boolean),
+];
+
+const isExcludedParticipant = (value) => {
   const normalized = normalizeName(value);
-  return normalized === BOT_NAME_NORMALIZED || normalized.includes('bot');
+  return normalized === BOT_NAME_NORMALIZED
+    || EXCLUDED_PARTICIPANT_TERMS.some((term) => normalized.includes(term));
 };
+
+const splitParticipants = (names) => names.reduce((acc, name) => {
+  if (!name) {
+    return acc;
+  }
+
+  if (name === 'You' || isExcludedParticipant(name)) {
+    acc.excluded.push(name);
+    return acc;
+  }
+
+  acc.included.push(name);
+  return acc;
+}, { included: [], excluded: [] });
 
 /**
  * DOM selectors for the Teams web client.
@@ -61,6 +95,52 @@ class SessionManager {
     this.error      = null;
   }
 
+  async ensureRosterOpen() {
+    const rosterVisible = await this.page.locator(SEL.rosterPanel).isVisible().catch(() => false);
+    const rosterContentVisible = await this.page.locator(`${SEL.participantName}, [role="listitem"]`).first().isVisible().catch(() => false);
+    if (rosterVisible || rosterContentVisible) {
+      return true;
+    }
+
+    logger.info('Roster panel not visible — reopening...');
+    await this.page.click(SEL.participantsBtn, { timeout: 5000 });
+
+    try {
+      await this.page.waitForSelector(`${SEL.rosterPanel}, ${SEL.participantName}, [role="listitem"]`, { timeout: 5000 });
+      return true;
+    } catch {
+      await this.page.waitForTimeout(1500);
+      const rosterVisibleAfterWait = await this.page.locator(SEL.rosterPanel).isVisible().catch(() => false);
+      const rosterContentVisibleAfterWait = await this.page.locator(`${SEL.participantName}, [role="listitem"]`).first().isVisible().catch(() => false);
+      return rosterVisibleAfterWait || rosterContentVisibleAfterWait;
+    }
+  }
+
+  async getFirstVisibleLocator(selector) {
+    const locators = await this.page.locator(selector).all();
+    for (const locator of locators) {
+      if (await locator.isVisible().catch(() => false)) {
+        return locator;
+      }
+    }
+
+    return this.page.locator(selector).first();
+  }
+
+  async closeRosterPanelIfOpen() {
+    const rosterContentVisible = await this.page.locator(`${SEL.participantName}, [role="listitem"]`).first().isVisible().catch(() => false);
+    if (!rosterContentVisible) {
+      return;
+    }
+
+    const participantsButton = await this.getFirstVisibleLocator(SEL.participantsBtn);
+    if (await participantsButton.isVisible().catch(() => false)) {
+      logger.info('Closing roster panel before opening chat...');
+      await participantsButton.click({ timeout: 5000 }).catch(() => {});
+      await this.page.waitForTimeout(1000);
+    }
+  }
+
   /**
    * Scrapes the currently visible participant names from the roster panel.
    * Returns a deduplicated, sorted array of display name strings.
@@ -68,11 +148,9 @@ class SessionManager {
   async scrapeParticipants() {
     try {
       // Ensure panel is open
-      const panelVisible = await this.page.locator(SEL.rosterPanel).isVisible().catch(() => false);
+      const panelVisible = await this.ensureRosterOpen();
       if (!panelVisible) {
-        logger.info('Roster panel not visible — reopening...');
-        await this.page.click(SEL.participantsBtn, { timeout: 5000 });
-        await this.page.waitForTimeout(1500);
+        logger.warn('Roster panel could not be confirmed as open before scraping.');
       }
 
       // Try to find and wait for participant elements
@@ -87,7 +165,7 @@ class SessionManager {
       let names = await this.page.$$eval(SEL.participantName, (els) =>
         els
           .map((el) => el.textContent?.trim())
-          .filter((n) => n && n.length > 0 && n !== 'You' && !isExcludedBotName(n))
+          .filter((n) => n && n.length > 0)
       ).catch(() => []);
 
       // If no names found, try alternative extraction
@@ -97,13 +175,18 @@ class SessionManager {
         names = await this.page.$$eval('[role="listitem"]', (els) =>
           els
             .map((el) => el.textContent?.trim())
-            .filter((n) => n && n.length > 2 && n !== 'You' && !isExcludedBotName(n))
+            .filter((n) => n && n.length > 2)
         ).catch(() => []);
       }
 
+      const { included, excluded } = splitParticipants(names);
+      const uniqueExcluded = [...new Set(excluded)].sort((a, b) => a.localeCompare(b));
+      if (uniqueExcluded.length > 0) {
+        logger.info(`Filtered participant entries: ${uniqueExcluded.join(', ')}`);
+      }
+
       // Deduplicate and sort
-      this.participants = [...new Set(names)]
-        .filter((name) => !isExcludedBotName(name))
+      this.participants = [...new Set(included)]
         .sort((a, b) => a.localeCompare(b));
       logger.info(`Scraped ${this.participants.length} participant(s)`);
       
@@ -130,14 +213,14 @@ class SessionManager {
    */
   pickRandomParticipant() {
     const available = this.participants.filter(
-      (name) => !this.pickedNames.has(name) && !isExcludedBotName(name)
+      (name) => !this.pickedNames.has(name) && !isExcludedParticipant(name)
     );
     
     if (available.length === 0) {
       logger.warn('All participants already picked. Resetting the picked list.');
       this.pickedNames.clear(); // Reset if all picked
       const resetAvailable = this.participants.filter(
-        (name) => !this.pickedNames.has(name) && !isExcludedBotName(name)
+        (name) => !this.pickedNames.has(name) && !isExcludedParticipant(name)
       );
       if (resetAvailable.length === 0) return null;
       return resetAvailable[Math.floor(Math.random() * resetAvailable.length)];
@@ -159,8 +242,10 @@ class SessionManager {
     try {
       logger.info(`Attempting to send chat message: "${message}"`);
 
+      await this.closeRosterPanelIfOpen();
+
       // Open the chat panel first (it is hidden until the chat button is clicked)
-      const chatBtnLocator = this.page.locator(SEL.chatBtn).first();
+      const chatBtnLocator = await this.getFirstVisibleLocator(SEL.chatBtn);
       const chatBtnVisible = await chatBtnLocator.isVisible({ timeout: 3000 }).catch(() => false);
       if (chatBtnVisible) {
         logger.info('Opening chat panel...');
@@ -171,7 +256,7 @@ class SessionManager {
       }
 
       // Wait for chat input to become visible
-      const chatInputLocator = this.page.locator(SEL.chatInput).first();
+      const chatInputLocator = await this.getFirstVisibleLocator(SEL.chatInput);
       try {
         await chatInputLocator.waitFor({ state: 'visible', timeout: 8000 });
       } catch {
@@ -188,7 +273,7 @@ class SessionManager {
       await this.page.waitForTimeout(200);
 
       // Send the message
-      const sendBtnLocator = this.page.locator(SEL.sendButton).first();
+  const sendBtnLocator = await this.getFirstVisibleLocator(SEL.sendButton);
       const sendBtnVisible = await sendBtnLocator.isVisible({ timeout: 2000 }).catch(() => false);
       
       if (!sendBtnVisible) {
@@ -424,10 +509,20 @@ async function joinMeeting(meetingUrl) {
 
   // ── Step 7: Open participants panel and scrape ────────────────────────────
   await page.waitForSelector(SEL.participantsBtn, { timeout: 10000 });
-  await page.click(SEL.participantsBtn);
-  await page.waitForTimeout(1500);
+  await session.ensureRosterOpen();
 
-  await session.scrapeParticipants();
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    await session.scrapeParticipants();
+    if (session.participants.length > 0) {
+      break;
+    }
+
+    if (attempt < 3) {
+      logger.info(`Initial scrape returned 0 participants — retrying (${attempt + 1}/3)...`);
+      await page.waitForTimeout(2000);
+      await session.ensureRosterOpen();
+    }
+  }
 
   return session;
 }

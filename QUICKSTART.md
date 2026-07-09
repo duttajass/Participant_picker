@@ -117,6 +117,7 @@ BOT_NAME=PickerBot          # Name shown in Teams
 HEADLESS=false              # false = see browser, true = background
 AUTO_REFRESH_MS=15000       # Refresh participants every 15s (0 = off)
 JOIN_TIMEOUT_MS=30000       # Timeout for joining meeting
+EXCLUDED_PARTICIPANT_TERMS=recording,transcription  # Optional extra roster entries to ignore
 ```
 
 ---
